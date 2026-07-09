@@ -201,7 +201,10 @@ def rejection_random_sample_kernel(
                                         other=-1,
                                     )
 
-                                    match_mask = candidate_indices == draft_token_id
+                                    valid_candidate_mask = (candidate_indices >= 0) & (
+                                        candidate_indices < global_vocab_size
+                                    )
+                                    match_mask = valid_candidate_mask & (candidate_indices == draft_token_id)
 
                                     candidate_probs = tl.load(
                                         target_probs_ptr + token_idx * vocab_size + vocab_offsets,
@@ -339,23 +342,25 @@ def sample_recovered_tokens_kernel(
             # Load target prob and global index
             tprob = tl.load(target_probs_ptr + token_idx * C + offs, mask=mask, other=0.0).to(tl.float32)
 
-            gidx = tl.load(target_indices_ptr + token_idx * C + offs, mask=mask, other=0).to(tl.int64)
+            gidx = tl.load(target_indices_ptr + token_idx * C + offs, mask=mask, other=-1).to(tl.int64)
+            valid_candidate = (gidx >= 0) & (gidx < global_vocab_size) & mask
 
             if NO_DRAFT_PROBS:
-                is_draft = (gidx == draft_token_id) & mask
-                prob = tl.where(is_draft, 0.0, tprob)
+                is_draft = (gidx == draft_token_id) & valid_candidate
+                prob = tl.where(valid_candidate & (~is_draft), tprob, 0.0)
             else:
-                valid = (gidx >= 0) & (gidx < global_vocab_size) & mask
-                dprob = tl.load(draft_probs_ptr + token_idx * global_vocab_size + gidx, mask=valid, other=0.0).to(
-                    tl.float32
-                )
-                prob = tl.maximum(tprob - dprob, 0.0)
+                dprob = tl.load(
+                    draft_probs_ptr + token_idx * global_vocab_size + gidx,
+                    mask=valid_candidate,
+                    other=0.0,
+                ).to(tl.float32)
+                prob = tl.where(valid_candidate, tl.maximum(tprob - dprob, 0.0), 0.0)
 
             qv = tl.load(q_ptr + req_idx * C + offs, mask=mask, other=1.0).to(tl.float32)
 
             bad_q = (qv <= 0) | (qv != qv) | (qv == float("inf")) | (qv == -float("inf"))
             score = tl.where(bad_q, float("-inf"), prob / qv)
-            score = tl.where(mask, score, float("-inf"))
+            score = tl.where(valid_candidate, score, float("-inf"))
 
             block_best_score = tl.max(score, axis=0)
             block_best_idx = tl.argmax(score, axis=0).to(tl.int64)
@@ -542,7 +547,10 @@ def rejection_random_sample_block_verify_kernel(
                                     other=-1,
                                 )
 
-                                match_mask = candidate_indices == draft_token_id
+                                valid_candidate_mask = (candidate_indices >= 0) & (
+                                    candidate_indices < global_vocab_size
+                                )
+                                match_mask = valid_candidate_mask & (candidate_indices == draft_token_id)
 
                                 candidate_probs = tl.load(
                                     target_probs_ptr + token_idx * vocab_size + vocab_offsets,
