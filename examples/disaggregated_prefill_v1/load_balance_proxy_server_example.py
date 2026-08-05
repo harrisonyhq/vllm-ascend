@@ -158,6 +158,32 @@ class InstanceType:
 TAINT_PRIORITY = 1e15
 
 
+def extract_cached_tokens(response_json: dict) -> int | None:
+    usage = response_json.get("usage") or {}
+    prompt_tokens_details = usage.get("prompt_tokens_details") or {}
+    cached_tokens = prompt_tokens_details.get("cached_tokens")
+    return cached_tokens if isinstance(cached_tokens, int) else 0
+
+
+def update_cached_tokens_in_chunk(chunk_json: dict, cached_tokens: int | None) -> bool:
+    if cached_tokens is None:
+        return False
+    usage = chunk_json.get("usage")
+    if not isinstance(usage, dict):
+        return False
+    prompt_tokens_details = usage.get("prompt_tokens_details")
+    if not isinstance(prompt_tokens_details, dict):
+        prompt_tokens_details = {}
+        usage["prompt_tokens_details"] = prompt_tokens_details
+    prompt_tokens_details["cached_tokens"] = cached_tokens
+    return True
+
+
+def encode_response_chunk(chunk_json: dict, is_sse: bool) -> bytes:
+    chunk = json.dumps(chunk_json, ensure_ascii=False).encode("utf-8")
+    return b"data: " + chunk + b"\n\n" if is_sse else chunk
+
+
 class ServerState:
     def __init__(self, host, port):
         self.host = host
@@ -664,20 +690,33 @@ async def _handle_select_instance(api: str, req_data: Any, request_length: int):
     prefiller_idx = proxy_state.select_prefiller(prefiller_score)
     prefiller = proxy_state.prefillers[prefiller_idx]
     # Send request to prefiller
-    response = await send_request_to_service(
-        prefiller.client,
-        prefiller_idx,
-        api,
-        req_data,
-        request_id,
-        max_retries=global_args.max_retries,
-        base_delay=global_args.retry_delay,
-    )
+    try:
+        response = await send_request_to_service(
+            prefiller.client,
+            prefiller_idx,
+            api,
+            req_data,
+            request_id,
+            max_retries=global_args.max_retries,
+            base_delay=global_args.retry_delay,
+        )
+    except Exception:
+        # Prefill failed (e.g. prompt longer than the prefiller's
+        # max_model_len, which the engine rejects with HTTP 400). Release the
+        # tokens and kv-cache we reserved in select_prefiller so the
+        # prefiller's heap priority is not left inflated -- otherwise the
+        # min-priority balancer keeps routing traffic away from this still
+        # healthy prefiller for a long time.
+        proxy_state.release_prefiller(prefiller_idx, prefiller_score)
+        proxy_state.release_prefiller_kv(prefiller_idx, prefiller_score)
+        raise
     proxy_state.release_prefiller(prefiller_idx, prefiller_score)
     response_json = response.json()
     kv_transfer_params = response_json.get("kv_transfer_params", {})
     if kv_transfer_params:
         req_data["kv_transfer_params"] = kv_transfer_params
+
+    prefiller_cached_tokens = extract_cached_tokens(response_json)
     # Select decoder
     decoder_score = proxy_state.calculate_decode_scores(request_length)
     logger.debug("Decoder score: %f", decoder_score)
@@ -693,6 +732,7 @@ async def _handle_select_instance(api: str, req_data: Any, request_length: int):
         decoder=decoder,
         decoder_idx=decoder_idx,
         decoder_score=decoder_score,
+        prefiller_cached_tokens=prefiller_cached_tokens,
     )
 
 
@@ -705,6 +745,7 @@ class InstanceInfo:
     decoder_idx: int
     decoder_score: float
     decoder: ServerState
+    prefiller_cached_tokens: int | None = None
 
 
 async def _handle_completions(api: str, request: Request):
@@ -734,6 +775,7 @@ async def _handle_completions(api: str, request: Request):
             retry_count = 0
             retry = True
             completion_tokens = 0
+            reported_prefiller_cached_tokens = instance_info.prefiller_cached_tokens
 
             def release_prefiller_kv_once():
                 nonlocal released_kv
@@ -763,7 +805,8 @@ async def _handle_completions(api: str, request: Request):
                             continue
                         if not chunk_str:
                             continue
-                        if chunk_str.startswith("data: "):
+                        is_sse = chunk_str.startswith("data: ")
+                        if is_sse:
                             chunk_str = chunk_str[len("data: ") :]
                         try:
                             chunk_json = json.loads(chunk_str)
@@ -774,6 +817,8 @@ async def _handle_completions(api: str, request: Request):
                             continue
                         choices = chunk_json.get("choices", [])
                         if not choices:
+                            if update_cached_tokens_in_chunk(chunk_json, reported_prefiller_cached_tokens):
+                                chunk = encode_response_chunk(chunk_json, is_sse)
                             yield chunk
                             continue
 
@@ -807,6 +852,11 @@ async def _handle_completions(api: str, request: Request):
                             else:
                                 choice["text"] = generated_token
                             chunk = json.dumps(chunk_json).encode("utf-8")
+                        chunk_updated = False
+                        if update_cached_tokens_in_chunk(chunk_json, reported_prefiller_cached_tokens):
+                            chunk_updated = True
+                        if chunk_updated:
+                            chunk = encode_response_chunk(chunk_json, is_sse)
                         yield chunk
             except asyncio.CancelledError:
                 raise
